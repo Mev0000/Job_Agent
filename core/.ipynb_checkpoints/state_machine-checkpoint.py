@@ -2,24 +2,19 @@ import json
 import re
 
 class JobAgentStateMachine:
-    def __init__(self, llm_client, graph_rag, config, rules_prompt, json_template):
+    def __init__(self, llm_client, retriever, config, rules_prompt, json_template):
         """
         初始化 Agent 状态机
         :param llm_client: Gemma4Client 实例
-        :param graph_rag: DictGraphRAG 实例 (包含全局二级字典等)
-        :param config: 全局配置字典 (包含 max_hops 等)
-        :param rules_prompt: 核心判决法则 V2.0 文本
-        :param json_template: 5 步 CoT 输出格式文本
+        :param retriever: 双轨融合引擎实例 (内部自带 graph_rag)
+        ...
         """
         self.llm = llm_client
-        self.graph_rag = graph_rag
+        self.retriever = retriever          
+        self.graph_rag = retriever.graph    
         self.max_hops = config.get("max_hops", 3)
         
-        # 组装 System Prompt：法则 + 输出格式
         self.system_prompt = f"{rules_prompt}\n\n{json_template}"
-        
-        # 全量字典引用 (从 graph_rag 中获取，假设你在 graph_builder 中把 GLOBAL_DICT_TREE 存进去了)
-        # 注意：你需要确保你的 graph_builder 中有方法可以按需抛出这些大类的详细信息
         self.global_dict_tree = getattr(self.graph_rag, 'global_dict_tree', {})
 
     def _extract_json_from_text(self, text):

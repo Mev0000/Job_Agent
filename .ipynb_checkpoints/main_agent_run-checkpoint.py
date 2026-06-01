@@ -1,53 +1,86 @@
 import os
 import time
-import pickle
 import datetime
 import pandas as pd
 import re
+import yaml
 
-# 导入你现有的核心模块
+# 导入核心模块
 from core.state_machine import JobAgentStateMachine
-from core.retriever import AdvancedRetriever # 假设你之前的检索器是这个名字，如果是别的请修改
-import yaml # 用于简单加载 config
+from core.retriever import AdvancedRetriever
 
 # ==========================================
-# 1. 路径与配置设定 (完全适配当前目录)
+# 1. 路径与配置设定
 # ==========================================
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-# 假设测试集也放在 raw_jd 下
 TEST_CSV_PATH = os.path.join(PROJECT_ROOT, "data", "raw_jd", "2025_5.18_100.csv")
-DICT_CACHE_PATH = os.path.join(PROJECT_ROOT, "data", "cache", "global_dict_tree.pkl")
-# 输出结果放在 logs 目录下
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "output")
+DICT_CSV_PATH = os.path.join(PROJECT_ROOT, "data", "raw_jd", "2022年职业分类大典（整体修订）.csv")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 def load_config():
-    with open('config.yaml', 'r') as file:
-        return yaml.safe_load(file)
+    """安全加载配置文件"""
+    config_path = os.path.join(PROJECT_ROOT, 'config.yaml')
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as file:
+            return yaml.safe_load(file)
+    return {}
 
-def load_global_dict_cache():
-    if not os.path.exists(DICT_CACHE_PATH):
-        raise FileNotFoundError(f"找不到字典缓存，请先运行 build_dict_cache.py: {DICT_CACHE_PATH}")
-    print("⏳ 正在极速加载全局大典缓存...")
-    with open(DICT_CACHE_PATH, "rb") as f:
-        tree = pickle.load(f)
-    print("✅ 大典缓存加载完毕！")
-    return tree
+def load_occupation_corpus():
+    """从官方 CSV 中提取并构建纯净的向量语料库 (仅限三级和四级)"""
+    print(f"⏳ 正在读取大典构建基础语料库...")
+    if not os.path.exists(DICT_CSV_PATH):
+        raise FileNotFoundError(f"找不到职业大典源文件: {DICT_CSV_PATH}")
+        
+    df = pd.read_csv(DICT_CSV_PATH).fillna("")
+    corpus = []
+    
+    for _, row in df.iterrows():
+        code = str(row['职业编码']).strip()
+        dash_count = code.count('-')
+        
+        if dash_count in [2, 3]:
+            name = str(row['职业名称']).strip()
+            desc = re.sub(r'\s+', ' ', str(row['职业描述']).strip())
+            # 四级加上细分前缀，三级保持原样
+            text = f"【细分四级】{name}：{desc}" if dash_count == 3 else f"{name}：{desc}"
+            
+            corpus.append({
+                "code": code,
+                "name": name,
+                "text": text
+            })
+            
+    print(f"✅ 向量语料库构建完毕，共提取 {len(corpus)} 条记录。")
+    return corpus
 
 def main():
     print("="*60)
-    print("🚀 Job Agent (Gemma 4 Edition) - 批量测试框架启动中...")
+    print("🚀 Job Agent (Dual-Track RAG Edition) - 批量测试框架启动中...")
     print("="*60)
     
-    # 1. 加载配置和大典缓存
+    # 1. 加载配置与动态语料
     config = load_config()
-    global_dict_tree = load_global_dict_cache()
+    occupation_corpus = load_occupation_corpus()
     
-    # 2. 初始化核心组件 (保持你原有的初始化方式)
-    print("\n[模块加载 1/2] 初始化检索引擎...")
-    retriever = AdvancedRetriever(config) # 使用你现在的检索器初始化方式
+    # 2. 初始化核心组件
+    print("\n[模块加载 1/2] 正在启动双轨融合引擎 (BGE-M3 + GraphRAG) ...")
+    retriever = AdvancedRetriever(config, occupation_corpus)
     
-    print("[模块加载 2/2] 初始化 Agent 状态机...")
-    agent = JobAgentStateMachine(config, retriever)
+    print("\n[模块加载 2/2] 正在启动 Agent 状态机...")
+    
+    from core.llm_client import Gemma4Client       
+    from prompts.meta_rules import RULES_PROMPT    
+    from prompts.templates import JSON_TEMPLATE    
+
+    llm_client = Gemma4Client() 
+
+    agent = JobAgentStateMachine(
+        llm_client=llm_client,
+        retriever=retriever,
+        config=config,
+        rules_prompt=RULES_PROMPT,
+        json_template=JSON_TEMPLATE
+    )
     
     # 3. 读取测试数据集
     if not os.path.exists(TEST_CSV_PATH):
@@ -56,21 +89,20 @@ def main():
         
     df_test = pd.read_csv(TEST_CSV_PATH, encoding='utf-8-sig')
     total_records = len(df_test)
-    print(f"✅ 测试集加载完毕，共 {total_records} 条数据准备测试。")
+    print(f"✅ 测试集加载完毕，共 {total_records} 条数据准备测试。\n")
     print("-" * 60)
 
-    # 4. 统计指标计数器
     results_list = []
     task_hit_l3 = 0  
     task_hit_l2 = 0  
     
-    # 5. 开始跑批循环
+    # 4. 开始跑批循环
     for index, row in df_test.iterrows():
         row_id = row.get('_id', f"IDX_{index}")
         raw_name = str(row.get('job_name', '')).strip()
         raw_desc = str(row.get('job_descrip', '')).strip()
         
-        # 提取 Ground Truth
+        # 提取真实标签 (Ground Truth)
         acceptable_truths = set()
         for col_name in ['occupation_code', 'occupation_code1', 'occupation_code2', 'occupation_code3', '职业备选项']:
             code_val = str(row.get(col_name, '')).strip()
@@ -87,33 +119,26 @@ def main():
         print(f"\n▶️ [{index+1}/{total_records}] 正在处理: 【{raw_name}】")
         start_t = time.time()
         
-        # ==========================================
-        # 核心调用：触发 Agent 状态机
-        # ==========================================
-        # 你的 agent.run 需要返回最终结果字典或直接返回最终代码
         try:
-            # 根据你之前设计的状态机，这里调用 run 并获取最后确定的分类代码
-            final_result = agent.run(raw_name, raw_desc, "初始化上下文(可置空或用大典宏观结构)")
+            # ==========================================
+            # 第 0 跳：触发双轨融合引擎，生成高密度防弹 Prompt 上下文
+            # ==========================================
+            print("  🔍 正在通过双轨引擎进行全域扫描与图谱安检...")
+            initial_context = retriever.retrieve(raw_name, raw_desc)
             
-            # 解析状态机结果 (这里可能需要根据你 agent 的实际返回格式微调)
-            if isinstance(final_result, dict):
-                predicted_code = final_result.get("result_code", "未提取")
-                final_state = final_result.get("status", "UNKNOWN")
-            else:
-                predicted_code = final_result if final_result else "未提取"
-                final_state = "SUCCESS" if final_result else "FAILED"
-                
-            reasoning_log = "详见终端输出" # 如果你能从 agent 拿到完整思考流最好，否则先简单记录
+            # ==========================================
+            # 第 1 跳：触发大模型状态机执行 5步 CoT 逻辑闭环
+            # ==========================================
+            final_state, predicted_code, reasoning_log = agent.run(raw_name, raw_desc, initial_context)
             
         except Exception as e:
-            print(f"❌ 处理异常: {e}")
-            predicted_code = "处理报错"
+            print(f"  ❌ 处理异常: {e}")
             final_state = "ERROR"
-            reasoning_log = str(e)
+            predicted_code = "未提取"
+            reasoning_log = f"运行报错: {str(e)}"
         
         # 计算命中率
         predicted_lvl2 = "-".join(predicted_code.split('-')[:2]) if "-" in predicted_code else "未提取"
-
         is_hit_l3 = (predicted_code in acceptable_truths) if predicted_code != "未提取" else False
         is_hit_l2 = (predicted_lvl2 in acceptable_truths_lvl2) if predicted_lvl2 != "未提取" else False
 
@@ -125,7 +150,6 @@ def main():
         print(f"  🤖 预测结果: {predicted_code} (状态: {final_state})")
         print(f"  🏅 三级命中: {'✅' if is_hit_l3 else '❌'}  |  二级命中: {'✅' if is_hit_l2 else '❌'}")
         
-        # 记录结果
         results_list.append({
             "数据ID": row_id,
             "原始名称": raw_name,
@@ -138,13 +162,13 @@ def main():
             "Agent推理日志": reasoning_log
         })
 
-    # 6. 导出报告
+    # 5. 导出测试统计报告
     if results_list:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = os.path.join(OUTPUT_DIR, f"agent_eval_gemma4_{timestamp}.csv")
         
         df_results = pd.DataFrame(results_list)
-        
         valid_records = len(results_list)
         acc_l3 = (task_hit_l3 / valid_records) * 100
         acc_l2 = (task_hit_l2 / valid_records) * 100
