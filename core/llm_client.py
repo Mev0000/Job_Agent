@@ -5,14 +5,17 @@ class Gemma4Client:
     def __init__(self, config):
         """
         初始化 Gemma 4 API 客户端
-        :param config: 配置字典，包含 api_key, base_url, model_name 等
         """
-        # 从配置中读取参数，如果没提供则使用默认的本地 vLLM 端口
-        self.api_key = config.get("api_key", "EMPTY")  # vLLM 本地通常不需要鉴权
-        self.base_url = config.get("base_url", "http://localhost:8000/v1")
-        self.model_name = config.get("model_name", "gemma-4-31b-it") # 需要与你启动 vLLM 时的名字一致
+        # 获取 llm 配置块，如果找不到再用空字典兜底
+        llm_config = config.get("llm", {})
         
-        # 实例化 OpenAI 客户端
+        # 从 llm_config 中安全读取配置
+        self.api_key = llm_config.get("api_key", "ollama")  
+        self.base_url = llm_config.get("base_url", "http://127.0.0.1:11434/v1")
+        self.model_name = llm_config.get("model_name", "gemma4:31b") 
+        
+        print(f"\n[🔌 LLM 探针] 当前正试图连接的 API 地址是: {self.base_url}，模型名: {self.model_name}")
+        
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url
@@ -34,7 +37,7 @@ class Gemma4Client:
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                # top_p=0.9 # 可选配置
+                top_p=0.9 # 可选配置
             )
             
             # 返回模型生成的纯文本结果

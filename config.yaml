@@ -1,16 +1,18 @@
 llm:
-  model_name: "gemma4:31b"               # 必须是 Ollama 里显示的名字
-  base_url: "http://localhost:11434/v1" # Ollama 的原生 OpenAI 兼容端口
+  model_name: "gemma4:31b"               
+  base_url: "http://127.0.0.1:11434/v1" 
   api_key: "ollama"                  
   temperature: 0.15
   max_tokens: 2048
 
 agent:
-  max_hops: 3
+  max_hops: 6
 
 retriever:
-  model_path: "/root/autodl-tmp/bge-m3" 
-  top_k: 10
+  model_path: "/root/autodl-tmp/bge-m3"
+  reranker_path: "/root/autodl-tmp/bge-reranker-v2-m3" 
+  top_k_recall: 100
+  top_k_rerank: 10  
   
 data:
   graph_cache_path: "data/cache/job_dict_graph.pkl"

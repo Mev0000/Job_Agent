@@ -4,6 +4,8 @@ import datetime
 import pandas as pd
 import re
 import yaml
+import json
+import torch
 
 # 导入核心模块
 from core.state_machine import JobAgentStateMachine
@@ -26,7 +28,7 @@ def load_config():
     return {}
 
 def load_occupation_corpus():
-    """从官方 CSV 中提取并构建纯净的向量语料库 (仅限三级和四级)"""
+    """从官方 CSV 中提取并构建全量特征的语料库 (包含主要工作任务)"""
     print(f"⏳ 正在读取大典构建基础语料库...")
     if not os.path.exists(DICT_CSV_PATH):
         raise FileNotFoundError(f"找不到职业大典源文件: {DICT_CSV_PATH}")
@@ -38,11 +40,20 @@ def load_occupation_corpus():
         code = str(row['职业编码']).strip()
         dash_count = code.count('-')
         
+        # 只提取三级(大类)和四级(细分)
         if dash_count in [2, 3]:
-            name = str(row['职业名称']).strip()
-            desc = re.sub(r'\s+', ' ', str(row['职业描述']).strip())
-            # 四级加上细分前缀，三级保持原样
-            text = f"【细分四级】{name}：{desc}" if dash_count == 3 else f"{name}：{desc}"
+            name = str(row.get('职业名称', '')).strip()
+            desc = re.sub(r'\s+', ' ', str(row.get('职业描述', '')).strip())
+            
+            tasks = re.sub(r'\s+', ' ', str(row.get('主要工作任务', '')).strip())
+            
+            prefix = "【细分四级】" if dash_count == 3 else "【三级大类】"
+            
+            # 拼装全量文本：名称 + 描述 + 主要工作任务
+            text = f"{prefix}{name}：{desc}"
+            if tasks:
+                # 必须用明确的标识符，方便 retriever 和 Hop-2 用正则切除
+                text += f" 主要工作任务：{tasks}"
             
             corpus.append({
                 "code": code,
@@ -50,7 +61,7 @@ def load_occupation_corpus():
                 "text": text
             })
             
-    print(f"✅ 向量语料库构建完毕，共提取 {len(corpus)} 条记录。")
+    print(f"✅ 向量语料库构建完毕，共提取 {len(corpus)} 条记录 (已挂载全量工作任务)。")
     return corpus
 
 def main():
@@ -69,17 +80,17 @@ def main():
     print("\n[模块加载 2/2] 正在启动 Agent 状态机...")
     
     from core.llm_client import Gemma4Client       
-    from prompts.meta_rules import RULES_PROMPT    
-    from prompts.templates import JSON_TEMPLATE    
+    from prompts.meta_rules import SYSTEM_RULES_PROMPT    
+    from prompts.templates import JSON_COT_TEMPLATE    
 
-    llm_client = Gemma4Client() 
+    llm_client = Gemma4Client(config)
 
     agent = JobAgentStateMachine(
         llm_client=llm_client,
         retriever=retriever,
         config=config,
-        rules_prompt=RULES_PROMPT,
-        json_template=JSON_TEMPLATE
+        rules_prompt=SYSTEM_RULES_PROMPT,  
+        json_template=JSON_COT_TEMPLATE
     )
     
     # 3. 读取测试数据集
@@ -120,16 +131,15 @@ def main():
         start_t = time.time()
         
         try:
-            # ==========================================
-            # 第 0 跳：触发双轨融合引擎，生成高密度防弹 Prompt 上下文
-            # ==========================================
             print("  🔍 正在通过双轨引擎进行全域扫描与图谱安检...")
             initial_context = retriever.retrieve(raw_name, raw_desc)
+
+            torch.cuda.empty_cache()
             
-            # ==========================================
-            # 第 1 跳：触发大模型状态机执行 5步 CoT 逻辑闭环
-            # ==========================================
-            final_state, predicted_code, reasoning_log = agent.run(raw_name, raw_desc, initial_context)
+            result_dict = agent.run(raw_name, raw_desc, initial_context)
+            final_state = result_dict.get("status", "ERROR")
+            predicted_code = result_dict.get("code", "未提取")
+            reasoning_log = json.dumps(result_dict.get("reasoning", {}), ensure_ascii=False)
             
         except Exception as e:
             print(f"  ❌ 处理异常: {e}")
