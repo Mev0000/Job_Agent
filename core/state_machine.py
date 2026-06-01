@@ -14,7 +14,7 @@ class JobAgentStateMachine:
         self.retriever = retriever          
         self.graph_rag = retriever.graph    
         # 为了支持充裕的横向跳跃与深潜，设定跳数上限为 4
-        self.max_hops = config.get("max_hops", 4) 
+        self.max_hops = config.get("agent", {}).get("max_hops", 6)
         
         self.system_prompt = f"{rules_prompt}\n\n{json_template}"
         self.global_dict_tree = getattr(self.graph_rag, 'global_dict_tree', {})
