@@ -147,10 +147,18 @@ def main():
             predicted_code = "未提取"
             reasoning_log = f"运行报错: {str(e)}"
         
-        # 计算命中率
-        predicted_lvl2 = "-".join(predicted_code.split('-')[:2]) if "-" in predicted_code else "未提取"
-        is_hit_l3 = (predicted_code in acceptable_truths) if predicted_code != "未提取" else False
-        is_hit_l2 = (predicted_lvl2 in acceptable_truths_lvl2) if predicted_lvl2 != "未提取" else False
+        # 计算命中率 (兼容大模型越级预测到四级细分的情况)
+        if predicted_code not in ["未提取", "ERROR", "MANUAL_REVIEW", "8-00-00"]:
+            parts = predicted_code.split('-')
+            # 智能截断：如果预测了 2-02-10-03，强行截断为 2-02-10 用于比对三级标签
+            predicted_lvl3 = "-".join(parts[:3]) if len(parts) >= 3 else predicted_code
+            predicted_lvl2 = "-".join(parts[:2]) if len(parts) >= 2 else predicted_code
+            
+            is_hit_l3 = predicted_lvl3 in acceptable_truths
+            is_hit_l2 = predicted_lvl2 in acceptable_truths_lvl2
+        else:
+            is_hit_l3 = False
+            is_hit_l2 = False
 
         if is_hit_l3: task_hit_l3 += 1
         if is_hit_l2: task_hit_l2 += 1
