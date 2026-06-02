@@ -6,7 +6,7 @@ llm:
   max_tokens: 2048
 
 agent:
-  max_hops: 6
+  max_hops: 8
 
 retriever:
   model_path: "/root/autodl-tmp/bge-m3"

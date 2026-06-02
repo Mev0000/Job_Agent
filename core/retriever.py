@@ -54,10 +54,10 @@ class AdvancedRetriever:
 
         # ---------------- 3. 初始化 GraphRAG 专家安检引擎 ----------------
         print(f"🔄 [轨道 2-安检] 正在加载 GraphRAG 专家安检引擎...")
-        graph_dir = config.get("graph", {}).get("data_dir", "data/graph_tables/")
+        graph_dir = config.get("data", {}).get("graph_data_dir", "data/graph_tables/")
         self.graph = DictGraphRAG(data_dir=graph_dir)
         
-        cache_path = config.get("graph", {}).get("cache_path", "data/cache/graph_rag.pkl")
+        cache_path = config.get("data", {}).get("graph_cache_path", "data/cache/job_dict_graph.pkl")
         try:
             self.graph.load_from_disk(cache_path)
         except:
