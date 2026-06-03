@@ -15,7 +15,7 @@ from core.retriever import AdvancedRetriever
 # 1. 路径与配置设定
 # ==========================================
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-TEST_CSV_PATH = os.path.join(PROJECT_ROOT, "data", "raw_jd", "2025_5.18_100.csv")
+TEST_CSV_PATH = os.path.join(PROJECT_ROOT, "data", "raw_jd", "2025_5.18_500.csv")
 DICT_CSV_PATH = os.path.join(PROJECT_ROOT, "data", "raw_jd", "2022年职业分类大典（整体修订）.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "logs")
 

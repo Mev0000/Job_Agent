@@ -34,11 +34,14 @@ class AdvancedRetriever:
         self.corpus_dict = {item['code']: item for item in self.corpus}
         
         print(f"🔄 正在为 {len(self.corpus_texts)} 条大典语料建立混合索引 (提示：CPU计算较慢，约需1-2分钟)...")
+        corpus_texts = [item['text'] for item in self.corpus]
+
         self.corpus_embeddings = self.base_model.encode(
-            self.corpus_texts, 
-            return_dense=True, 
-            return_sparse=True, 
-            return_colbert_vecs=True
+            corpus_texts,  # ✅ 正确：只传入纯文本列表
+            return_dense=True,
+            return_sparse=True,
+            return_colbert_vecs=True,
+            batch_size=16
         )
         
         # ---------------- 2. 初始化 BGE-Reranker 精排引擎 (放到 CPU) ----------------
