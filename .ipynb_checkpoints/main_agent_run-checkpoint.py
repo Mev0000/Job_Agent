@@ -105,7 +105,15 @@ def main():
 
     results_list = []
     task_hit_l3 = 0  
-    task_hit_l2 = 0  
+    task_hit_l2 = 0
+    # 状态分类计数（P0决策：SUCCESS/REVIEW_SUGGESTED/GARBAGE/MELTDOWN/ERROR 独立统计）
+    status_counts = {
+        "SUCCESS": 0,
+        "REVIEW_SUGGESTED": 0,
+        "GARBAGE": 0,
+        "MELTDOWN": 0,
+        "ERROR": 0,
+    }
     
     # 4. 开始跑批循环
     for index, row in df_test.iterrows():
@@ -139,12 +147,14 @@ def main():
             result_dict = agent.run(raw_name, raw_desc, initial_context)
             final_state = result_dict.get("status", "ERROR")
             predicted_code = result_dict.get("code", "未提取")
+            confidence_score = result_dict.get("confidence", 0)   # P0-W: 提取置信度
             reasoning_log = json.dumps(result_dict.get("reasoning", {}), ensure_ascii=False)
             
         except Exception as e:
             print(f"  ❌ 处理异常: {e}")
             final_state = "ERROR"
             predicted_code = "未提取"
+            confidence_score = 0
             reasoning_log = f"运行报错: {str(e)}"
         
         # 计算命中率 (兼容大模型越级预测到四级细分的情况)
@@ -162,10 +172,16 @@ def main():
 
         if is_hit_l3: task_hit_l3 += 1
         if is_hit_l2: task_hit_l2 += 1
+        
+        # P0-F: 按状态分类独立计数
+        if final_state in status_counts:
+            status_counts[final_state] += 1
+        else:
+            status_counts["ERROR"] += 1
 
         print(f"  [耗时: {time.time() - start_t:.1f}s]")
         print(f"  🏆 真实标签池 (三级): {truth_occ_code}")
-        print(f"  🤖 预测结果: {predicted_code} (状态: {final_state})")
+        print(f"  🤖 预测结果: {predicted_code} (状态: {final_state}, 置信度: {confidence_score})")
         print(f"  🏅 三级命中: {'✅' if is_hit_l3 else '❌'}  |  二级命中: {'✅' if is_hit_l2 else '❌'}")
         
         results_list.append({
@@ -177,6 +193,7 @@ def main():
             "Top-1命中(三级)": is_hit_l3,
             "Top-1命中(二级)": is_hit_l2,
             "状态机终局": final_state,
+            "置信度评分": confidence_score,       # P0-W: 新增置信度列
             "Agent推理日志": reasoning_log
         })
 
@@ -191,11 +208,23 @@ def main():
         acc_l3 = (task_hit_l3 / valid_records) * 100
         acc_l2 = (task_hit_l2 / valid_records) * 100
         
+        # P0-F: 状态分布统计
+        n_success = status_counts.get("SUCCESS", 0)
+        n_review = status_counts.get("REVIEW_SUGGESTED", 0)
+        n_garbage = status_counts.get("GARBAGE", 0)
+        n_meltdown = status_counts.get("MELTDOWN", 0)
+        n_error = status_counts.get("ERROR", 0)
+        
         summary_row = pd.DataFrame([{
             "数据ID": "【最终统计】", 
             "原始名称": f"总测试量: {valid_records} 条",
             "Top-1命中(三级)": f"{acc_l3:.2f}%",
-            "Top-1命中(二级)": f"{acc_l2:.2f}%"
+            "Top-1命中(二级)": f"{acc_l2:.2f}%",
+            "状态机终局": (
+                f"SUCCESS={n_success} | REVIEW_SUGGESTED={n_review} | "
+                f"GARBAGE={n_garbage} | MELTDOWN={n_meltdown} | ERROR={n_error}"
+            ),
+            "置信度评分": "见各行"
         }])
         
         df_final = pd.concat([df_results, summary_row], ignore_index=True)
@@ -205,6 +234,12 @@ def main():
         print(f"🏆 测试跑批完毕！结果已保存至: {output_file}")
         print(f"  ⭐ 【三级细分】Top-1 命中率: {acc_l3:.2f}% ({task_hit_l3}/{valid_records})")
         print(f"  ⭐⭐ 【二级大类】Top-1 命中率: {acc_l2:.2f}% ({task_hit_l2}/{valid_records})")
+        print(f"  📊 状态分布:")
+        print(f"     ✅ SUCCESS        (自动入库):  {n_success} 条 ({n_success/valid_records*100:.1f}%)")
+        print(f"     🔍 REVIEW_SUGGESTED (人工复核): {n_review} 条 ({n_review/valid_records*100:.1f}%)")
+        print(f"     🗑️ GARBAGE         (垃圾岗位):  {n_garbage} 条 ({n_garbage/valid_records*100:.1f}%)")
+        print(f"     💥 MELTDOWN        (推理失败):  {n_meltdown} 条 ({n_meltdown/valid_records*100:.1f}%)")
+        print(f"     ❌ ERROR           (系统异常):  {n_error} 条 ({n_error/valid_records*100:.1f}%)")
         print("="*60)
 
 if __name__ == "__main__":

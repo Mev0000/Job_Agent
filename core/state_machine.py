@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import Dict, List, Optional
 
 class JobAgentStateMachine:
     def __init__(self, llm_client, retriever, config, rules_prompt, json_template):
@@ -17,6 +18,16 @@ class JobAgentStateMachine:
         
         self.system_prompt = f"{rules_prompt}\n\n{json_template}"
         self.global_dict_tree = getattr(self.graph_rag, 'global_dict_tree', {})
+        
+        # 置信度评分配置（可通过config.yaml调整）
+        self.confidence_config = config.get("agent", {}).get("confidence", {
+            "threshold_review": 75,  # 低于此分数标记为REVIEW_SUGGESTED
+            "score_full_match": 30,   # 三维全同构加分
+            "score_rule_hit": 20,       # 口诀强制命中加分
+            "penalty_99": -25,          # 使用99兜底减分
+            "penalty_p1_mismatch": -20,  # P1不一致但仍选择减分
+            "penalty_global_search": -10   # 经过GLOBAL_SEARCH重定向减分
+        })
 
     def _extract_json_from_text(self, text):
         """增强版 JSON 提取器，防 Markdown 干扰与非法转义"""
@@ -44,6 +55,68 @@ class JobAgentStateMachine:
             print(f"⚠️ 模型输出解析 JSON 失败: {e}")
             return None
 
+    def _calculate_confidence(self, result_json: Dict, reasoning: Dict, current_hop: int,
+                              trajectory_log: Optional[List[str]] = None,
+                              is_rule_forced: bool = False) -> int:
+        """
+        根据客观特征计算置信度评分（非LLM自评，防止过度自信）
+        
+        评分规则（可配置，见config.yaml的agent.confidence）：
+        基础分: 50
+        +30分: 三维全同构（交付物+核心动作+作用对象均"一致"/"匹配"）
+        +20分: 口诀强制命中（is_rule_forced=True，由检索层传入）[P1-A]
+        -25分: 使用99兜底代码
+        -10分: 经过GLOBAL_SEARCH重定向（通过trajectory_log轨迹匹配）[P1-B]
+        
+        返回：0-100的整数置信度评分
+        """
+        score = 50  # 基础分
+        
+        # 获取配置
+        cfg = self.confidence_config
+        score_full = cfg.get("score_full_match", 30)
+        score_rule = cfg.get("score_rule_hit", 20)
+        penalty_99 = cfg.get("penalty_99", -25)
+        penalty_gs = cfg.get("penalty_global_search", -10)
+        
+        # 检查是否使用99兜底
+        result_code = result_json.get("result_code", "")
+        if result_code.endswith("99"):
+            score += penalty_99
+        
+        # P1-B: 用trajectory_log轨迹字符串匹配，替代 hop > 3 的粗糙启发式判断
+        # 精确检测是否曾经触发过 GLOBAL_SEARCH 动作（说明初始方向错误，重新定向）
+        if trajectory_log:
+            if any("GLOBAL_SEARCH" in step for step in trajectory_log):
+                score += penalty_gs
+        elif current_hop > 3:
+            # 兼容旧调用（无trajectory_log传入时的降级方案）
+            score += penalty_gs
+            
+        # P1-A: 若检索层传入了 is_rule_forced=True（图谱口诀强制命中），加分
+        # is_rule_forced 由 retriever.retrieve() 在候选字典的元数据中传递
+        if is_rule_forced:
+            score += score_rule
+            
+        # 检查step_4的结构化比对结果（如果存在），计算三维全同构加分
+        step4 = reasoning.get("step_4_evidence_cross_match", {})
+        if isinstance(step4, dict):
+            check1 = str(step4.get("check_1_deliverables", ""))
+            check2 = str(step4.get("check_2_core_actions", ""))
+            check3 = str(step4.get("check_3_objects", ""))
+            
+            # 三维全同构判断：三项均包含"一致"或"匹配"关键词
+            positive_keywords = {"一致", "匹配", "符合", "吻合", "契合"}
+            def _is_positive(text: str) -> bool:
+                return any(kw in text for kw in positive_keywords)
+            
+            if _is_positive(check1) and _is_positive(check2) and _is_positive(check3):
+                score += score_full
+                
+        # 确保分数在0-100范围内
+        score = max(0, min(100, score))
+        return score
+            
     def run(self, job_name, job_desc, initial_candidates_context):
         """
         运行状态机主循环
@@ -80,6 +153,11 @@ class JobAgentStateMachine:
             result_code = result_json.get('result_code', 'UNKNOWN')
             reasoning = result_json.get("reasoning", {})
             
+            # P1-A: 从候选字典中提取 is_rule_forced 标记
+            # 该标记由 retriever.retrieve() 在找到图谱口诀强制匹配时写入候选字典
+            # 格式示例：{"is_rule_forced": true, "forced_code": "4-01-02"}
+            is_rule_forced = result_json.get("is_rule_forced", False)
+            
             step_summary = reasoning.get("step_5_isomorphic_finalize", "未完成定谳")
             exploration_ledger.append(f"-> [第 {current_hop} 跳尝试]: 动作 {action} ({result_code}) | 结论: {step_summary}")
             
@@ -88,9 +166,26 @@ class JobAgentStateMachine:
             # ---------------------------------------------
             if action == "FINALIZE":
                 print(f"  ✅ [Hop {current_hop}] 成功定谳，代码: {result_code}")
+                
+                # 计算置信度评分（客观规则，非LLM自评）
+                # P1-A: 传入 is_rule_forced；P1-B: 传入 trajectory_log 用于精确轨迹匹配
+                confidence = self._calculate_confidence(
+                    result_json, reasoning, current_hop,
+                    trajectory_log=trajectory_log,
+                    is_rule_forced=is_rule_forced
+                )
+                
+                # 根据置信度决定状态
+                threshold = self.confidence_config.get("threshold_review", 75)
+                if confidence >= threshold:
+                    status = "SUCCESS"
+                else:
+                    status = "REVIEW_SUGGESTED"  # 建议人工复核
+                
                 return {
-                    "status": "SUCCESS", 
+                    "status": status, 
                     "code": result_code, 
+                    "confidence": confidence,
                     "reasoning": reasoning,
                     "log": trajectory_log
                 }
@@ -103,6 +198,7 @@ class JobAgentStateMachine:
                 return {
                     "status": "GARBAGE", 
                     "code": "8-00-00", 
+                    "confidence": 0,  # 垃圾岗位置信度默认为0
                     "reasoning": reasoning,
                     "log": trajectory_log
                 }
@@ -115,7 +211,7 @@ class JobAgentStateMachine:
 
                 if current_hop >= self.max_hops:
                     print(f"  💥 [Hop {current_hop}] 达到最大跳数限制，熔断退出。转人工复核。")
-                    return {"status": "MELTDOWN", "code": "MANUAL_REVIEW", "reasoning": reasoning, "log": trajectory_log}
+                    return {"status": "MELTDOWN", "code": "MANUAL_REVIEW", "confidence": 0, "reasoning": reasoning, "log": trajectory_log}
                 
                 # 完美对齐 2022 修订版大典官方最精准的一二级大类标准名称网
                 # 完美对齐 2022 修订版大典官方最精准的一二级大类标准名称网 (100%全量无损版)
@@ -276,7 +372,7 @@ class JobAgentStateMachine:
                 
                 if current_hop >= self.max_hops:
                     print(f"  💥 [Hop {current_hop}] 达到最大跳数限制，熔断退出。转人工复核。")
-                    return {"status": "MELTDOWN", "code": "MANUAL_REVIEW", "reasoning": reasoning, "log": trajectory_log}
+                    return {"status": "MELTDOWN", "code": "MANUAL_REVIEW", "confidence": 0, "reasoning": reasoning, "log": trajectory_log}
                 
                 requested_l2_codes = re.findall(r'\d-\d{2}', str(result_code))
                 if not requested_l2_codes:
@@ -327,7 +423,7 @@ class JobAgentStateMachine:
                 
                 if current_hop >= self.max_hops:
                     print(f"  💥 [Hop {current_hop}] 达到最大跳数限制，熔断退出。转人工复核。")
-                    return {"status": "MELTDOWN", "code": "MANUAL_REVIEW", "reasoning": reasoning, "log": trajectory_log}
+                    return {"status": "MELTDOWN", "code": "MANUAL_REVIEW", "confidence": 0, "reasoning": reasoning, "log": trajectory_log}
                 
                 # 兼容列表或字符串提取
                 req_l3_list = result_code if isinstance(result_code, list) else re.findall(r'\d-\d{2}-\d{2}', str(result_code))
@@ -371,6 +467,7 @@ class JobAgentStateMachine:
         return {
             "status": "MELTDOWN", 
             "code": "MANUAL_REVIEW", 
+            "confidence": 0,
             "reasoning": {"error": "已耗尽最大跳数，或模型连续输出未知指令"}, 
             "log": trajectory_log
         }
