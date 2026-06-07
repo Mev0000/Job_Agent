@@ -76,7 +76,7 @@ class AdvancedRetriever:
         vector_candidates = self._get_vector_candidates(job_name, job_desc)
         
         # 阶段 2：GraphRAG 深度安检与强制绑定 (图谱路)
-        audited_pool = self._audit_and_bind(vector_candidates)
+        audited_pool = self._audit_and_bind(vector_candidates, job_name, job_desc)
         
         # 阶段 3：宁缺毋滥的断崖式阶梯截断
         final_candidates = self._cliff_cut(audited_pool)
@@ -87,7 +87,104 @@ class AdvancedRetriever:
         # 阶段 5：组装高密度信息胶囊 (喂给 LLM)
         final_prompt_context = self._format_prompt_context(final_candidates)
         
+        # P1-A（Prompt注入）：检测口诀强制命中，注入提示给LLM
+        rule_forced_in_final = []
+        for code, data in audited_pool.items():
+            if code not in final_candidates:
+                continue
+            warnings = data.get("confusion_warnings", set())
+            if any("严禁" in w or "必须" in w or "只能" in w or "强制" in w for w in warnings):
+                rule_forced_in_final.append(code)
+        if rule_forced_in_final:
+            final_prompt_context += "\n⚠️ 口诀强制命中：" + "、".join(rule_forced_in_final) + "\n"
+
+
         return final_prompt_context
+
+    def retrieve_scoped(self, job_name: str, job_desc: str, l2_prefixes: List[str]) -> str:
+        """【REQ_L2 兜底】在指定 L2 范围内做二次 Reranker 向量召回 + 置信度门控
+        
+        当 LLM 触发 REQ_L2 选定大类后，直接用 Reranker 对 L2 范围内所有候选做交叉打分。
+        L2 通常 10-80 条，速度快。返回 Top 8 候选的完整 7D 格式化上下文。
+        
+        🌟 置信度门控：若该 L2 内 Top 3 Reranker 平均分低于阈值，
+        系统会在返回的上下文中注入「低置信度警报」，提示 LLM 该 L2 可能选错。
+        用于解决「LLM 选错 L2 → scoped 召回全错 → LLM 更自信地选错」的死亡螺旋。
+        
+        Args:
+            job_name: 岗位名称
+            job_desc: 岗位职责描述
+            l2_prefixes: L2 前缀列表，如 ["4-01"]
+            
+        Returns:
+            格式化后的候选上下文字符串（含置信度信号）
+        """
+        query_text = f"岗位名称：{job_name}。职责描述：{job_desc}"
+        
+        # 1. 筛选 L2 范围内的候选
+        scoped_candidates = []
+        for item in self.corpus:
+            for prefix in l2_prefixes:
+                if item['code'].startswith(prefix + '-'):
+                    scoped_candidates.append(item)
+                    break
+        
+        if not scoped_candidates:
+            return ""
+        
+        # 2. 用 Reranker 对所有范围内候选打分
+        texts = [item['text'] for item in scoped_candidates]
+        scores = self._compute_rerank_scores(query_text, texts)
+        
+        # 3. 取 Top 8 高置信度候选
+        top_k = min(8, len(scoped_candidates))
+        best_indices = np.argsort(scores)[::-1][:top_k]
+        
+        # ── 置信度门控：Top 3 平均分 ──
+        top3_avg = float(np.mean(scores[best_indices[:min(3, top_k)]]))
+        top1_score = float(scores[best_indices[0]])
+        low_confidence = top3_avg < 0.3  # 阈值：经验值，后续可根据实际数据调整
+        
+        vector_candidates = []
+        for idx in best_indices:
+            item = scoped_candidates[idx]
+            vector_candidates.append({
+                "code": item['code'],
+                "name": item.get('name', '未知职务'),
+                "text": item['text'],
+                "score": float(scores[idx])
+            })
+        
+        # 4. 走标准管线：图谱安检 → 截断 → 虫洞 → 格式化
+        audited_pool = self._audit_and_bind(vector_candidates, job_name, job_desc)
+        final_candidates = self._cliff_cut(audited_pool)
+        self._apply_wormhole_warnings(final_candidates)
+        context = self._format_prompt_context(final_candidates)
+        
+        # ── 5. 置信度信号注入 ──
+        signal_header = ""
+        if low_confidence:
+            signal_header = (
+                f"\n\n🚨🚨🚨 【系统置信度警报 — 请认真阅读】🚨🚨🚨\n"
+                f"Reranker 对该 L2({l2_prefixes})范围内所有候选做了交叉注意力打分：\n"
+                f"  - 最高分: {top1_score:.3f}\n"
+                f"  - Top 3 平均分: {top3_avg:.3f}\n"
+                f"  - 阈值: 0.30\n\n"
+                f"⚠️ 该 L2 大类下候选与你的岗位描述匹配度【整体偏低】，原因极可能是：\n"
+                f"  1. 你选错了二级大类（当前在 {l2_prefixes}，正确大类可能在其他地方）\n"
+                f"  2. 或者该岗位确实是一个边缘/跨类岗位\n\n"
+                f"🔴 强制要求：请在 Step 3 独立假说中明确讨论「当前选 {l2_prefixes} 是否正确」。\n"
+                f"   如果确信选错，立即输出 action=\"REQ_L2\" 换大类，严禁凑合 FINALIZE。\n"
+                f"🚨🚨🚨 【警报结束】🚨🚨🚨"
+            )
+        else:
+            signal_header = (
+                f"\n\n📊 【系统信息：置信度信号】\n"
+                f"Reranker 对该 L2 范围内 Top 3 平均分: {top3_avg:.3f}（≥ 阈值 0.30，置信度正常）\n"
+                f"最高分候选: {top1_score:.3f}"
+            )
+        
+        return signal_header + "\n\n" + context
 
     def _compute_rerank_scores(self, query: str, texts: List[str], batch_size=4) -> np.ndarray:
         """原生 Reranker 批处理打分机制，防 OOM"""
@@ -190,9 +287,15 @@ class AdvancedRetriever:
             
         return final_vector_candidates
 
-    def _audit_and_bind(self, vector_candidates: List[Dict]) -> Dict[str, Dict]:
-        """【阶段 2】图谱特征注入与易混淆强制绑定"""
+    def _audit_and_bind(self, vector_candidates: List[Dict], job_name: str, job_desc: str) -> Dict[str, Dict]:
+        """【阶段 2】图谱特征注入与易混淆强制绑定
+        
+        P1 优化：Force-bind 候选使用 Reranker 独立打分，
+        而非简单继承原始候选分数（避免分数严重失真）
+        """
         audited_pool = {}
+        query_text = f"岗位名称：{job_name}。职责描述：{job_desc}"
+
         for cand in vector_candidates:
             code = cand['code']
             if code in audited_pool: continue
@@ -214,11 +317,23 @@ class AdvancedRetriever:
                     c_features = self.graph.get_job_features(c_code)
                     c_corpus_data = self.corpus_dict.get(c_code)
                     if c_features and c_corpus_data:
+                        # P1 优化：使用 Reranker 对 JD 和该易混对手单独打分
+                        c_text = c_corpus_data['text']
+                        with torch.no_grad():
+                            inputs = self.reranker_tokenizer(
+                                [[query_text, c_text]],  # ✅ 修复：传入 List[List[str, str]] 格式
+                                padding=True, truncation=True,
+                                return_tensors='pt', max_length=2048
+                            ).to(self.device)
+                            logits = self.reranker_model(**inputs, return_dict=True).logits
+                            # logits 形状: (1, 1) 或 (1, num_labels)，取第一个元素的第一个 logit
+                            c_score = float(torch.sigmoid(logits[0][0]))
+                        
                         audited_pool[c_code] = {
                             "source": "GraphRAG_Force_Bind", 
-                            "score": cand['score'] - 0.001, # 绑定分数
+                            "score": c_score,  # 独立打分，非继承
                             "name": c_corpus_data.get('name', '未知职务'),
-                            "text": c_corpus_data['text'],
+                            "text": c_text,
                             "features": c_features,
                             "confusion_warnings": set(), "wormhole_warnings": set()
                         }
@@ -226,28 +341,46 @@ class AdvancedRetriever:
                 audited_pool[code]["confusion_warnings"].add(f"与 [{c_code}] 易混淆：{rule_text}")
                 if c_code in audited_pool:
                     audited_pool[c_code]["confusion_warnings"].add(f"与 [{code}] 易混淆：{rule_text}")
+        
+        # P1 优化：对所有 Force_Bind 候选做一轮 Reranker 独立打分（修正分数失真）
+        force_bind_codes = [c for c, d in audited_pool.items() if d['source'] == "GraphRAG_Force_Bind"]
+        if force_bind_codes:
+            rerank_texts = [audited_pool[c]['text'] for c in force_bind_codes]
+            # 使用已有的 _compute_rerank_scores 方法，避免重复代码和潜在错误
+            rerank_probs = self._compute_rerank_scores(query_text, rerank_texts)
+            for c, s in zip(force_bind_codes, rerank_probs):
+                audited_pool[c]['score'] = float(s)
 
         return audited_pool
 
     def _cliff_cut(self, pool: Dict[str, Dict]) -> List[Tuple[str, Dict]]:
-        """【阶段 3】动态阶梯截断与去重机制"""
+        """【阶段 3】动态阶梯截断与去重机制
+        
+        P1 优化：Force-Bind 候选最多占 4/8 席，防止易混对手挤占向量精排结果
+        """
         sorted_items = sorted(pool.items(), key=lambda x: x[1]['score'], reverse=True)
         if not sorted_items: return []
 
         MAX_CANDIDATES = 8           
         MIN_ABS_SCORE = 0.3          
         CLIFF_TOLERANCE = 0.15       
-        MAX_SAME_L2 = 4              
-        
+        MAX_SAME_L2 = 4
+        MAX_FORCE_BIND = 4  # P1 优化：Force-Bind 最多占 4/8 席
+
         top1_score = sorted_items[0][1]['score']
         dynamic_min_score = top1_score * 0.5  
-        
+
         final_candidates = []
         l2_counts = {}
+        force_bind_count = 0
 
         for i, (code, data) in enumerate(sorted_items):
             score = data['score']
             is_force_bind = (data['source'] == "GraphRAG_Force_Bind")
+
+            # P1 优化：Force-Bind 席位上限检查
+            if is_force_bind and force_bind_count >= MAX_FORCE_BIND:
+                continue
 
             if not is_force_bind:
                 if score < MIN_ABS_SCORE or score < dynamic_min_score: break 
@@ -256,6 +389,9 @@ class AdvancedRetriever:
                 l2_prefix = "-".join(code.split('-')[:2]) 
                 if l2_counts.get(l2_prefix, 0) >= MAX_SAME_L2: continue
                 l2_counts[l2_prefix] = l2_counts.get(l2_prefix, 0) + 1
+
+            if is_force_bind:
+                force_bind_count += 1
 
             final_candidates.append((code, data))
             if len(final_candidates) >= MAX_CANDIDATES: break
@@ -274,42 +410,66 @@ class AdvancedRetriever:
                     final_candidates[j][1]["wormhole_warnings"].add(f"绝对互斥预警: 与 [{code_a}] 不兼容 -> {rule}")
 
     def _format_prompt_context(self, final_candidates: List[Tuple[str, Dict]]) -> str:
-        """【阶段 5】组装高密度信息胶囊"""
+        """【阶段 5】组装高密度信息胶囊（展示全量 7D 特征）"""
         context_blocks = ["<candidates_reference>\n"]
+        MAX_CANDIDATES = 8
+
         for rank, (code, data) in enumerate(final_candidates):
             score = data['score']
             name = data['name']
             features = data['features']
-            source_tag = "📌 图谱特权保送" if data['source'] == "GraphRAG_Force_Bind" else f"🌐 语义精排置信度: {score:.2f}"
-            
+            is_force = data['source'] == "GraphRAG_Force_Bind"
+            source_tag = "📌 图谱特权保送" if is_force else f"🌐 语义精排置信度: {score:.2f}"
+
             block = f"### [{code}] {name} ({source_tag})\n"
             clean_text = re.sub(r'主要工作任务.*', '', data['text'], flags=re.DOTALL).strip()
             block += f"- 官方定义: {clean_text}\n"
-            
-            f_actions = ", ".join(features.get('动作', []))[:50] 
-            f_objs = ", ".join(features.get('对象', []))[:50]
-            f_envs = ", ".join(features.get('环境', []))[:50]
-            block += f"- 🔍 图谱核磁扫描: 动作[{f_actions}]; 对象[{f_objs}]; 环境[{f_envs}]\n"
-            
+
+            # ── 分层展示策略 ──
+            # 前 3 条：全量 7D 展示（LLM 需要精细比对）
+            # 候选 4~8：精简展示（仅名称+定义+核心动作+交付物，口诀如有则保留）
+            if rank < 3:
+                # 全量 7D
+                a = ", ".join(features.get('core_actions', []) or features.get('动作', []))[:100]
+                o = ", ".join(features.get('objects', []) or features.get('对象', []))[:100]
+                d = ", ".join(features.get('deliverables', []) or features.get('交付物', []))[:100]
+                e = ", ".join(features.get('environment', []) or features.get('环境', []))[:100]
+                k = features.get('main_kpi', '') or ''
+                s = ", ".join(features.get('served_population', []) if isinstance(features.get('served_population'), list) else ([features.get('served_population', '')] if features.get('served_population') else []))[:100]
+                r = features.get('role_level', '') or ''
+
+                block += f"- 🔍 7D 特征扫描:\n"
+                block += f"  核心动作: {a}\n"   if a else ""
+                block += f"  交付物:   {d}\n"   if d else ""
+                block += f"  作用对象: {o}\n"   if o else ""
+                block += f"  工作环境: {e}\n"   if e else ""
+                block += f"  核心 KPI: {k}\n"   if k else ""
+                block += f"  服务对象: {s}\n"   if s else ""
+                block += f"  责任层级: {r}\n"   if r else ""
+            else:
+                # 精简模式：只展示最关键的诊断信息
+                a_short = ", ".join(features.get('core_actions', []) or features.get('动作', []))[:60]
+                d_short = ", ".join(features.get('deliverables', []) or features.get('交付物', []))[:60]
+                block += f"- 🔍 核心动作: {a_short}  |  交付物: {d_short}\n"
+
+            # 法理红线（全量展示）
             redlines = []
             if features.get("是否涉公权"): redlines.append("⚠️ 涉国家公权执行")
             if features.get("是否涉临床"): redlines.append("⚠️ 涉医疗处方/临床")
             if redlines: block += f"- ⚖️ 法理体检: {' | '.join(redlines)}\n"
-                
+
+            # 易混淆口诀（全量展示）
             if data['confusion_warnings']:
                 block += f"- 🚨 系统级鉴别诊断 (请严格应用以下规则进行抉择):\n"
                 for warning in data['confusion_warnings']: block += f"   👉 {warning}\n"
-                    
+
+            # 虫洞互斥（全量展示）
             if data['wormhole_warnings']:
                 block += f"- ⛔ 虫洞互斥排查 (本选项与下方其他候选项存在业务冲突):\n"
                 for warning in data['wormhole_warnings']: block += f"   ❌ {warning}\n"
-            
+
             block += "\n"
             context_blocks.append(block)
-            
+
         context_blocks.append("</candidates_reference>")
-        final_str = "".join(context_blocks)
-        if len(final_str) > 4500:
-            final_str = final_str[:4500] + "\n...[为保护大模型上下文，后续备选项已截断]\n</candidates_reference>"
-            
-        return final_str
+        return "".join(context_blocks)

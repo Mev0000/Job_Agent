@@ -1,0 +1,38 @@
+llm:
+  model_name: "gemma4:31b"               
+  base_url: "http://127.0.0.1:11434/v1" 
+  api_key: "ollama"                  
+  temperature: 0.15
+  max_tokens: 2048
+  # P1-X: 显式设置上下文窗口为8192，确保覆盖3个Few-shot示例+动态账本的Prompt消耗（约3000-4500 tokens）
+  # 在Ollama中对应 num_ctx 参数，需在启动模型时生效（如：ollama run gemma4:31b --num_ctx 8192）
+  num_ctx: 8192
+
+agent:
+  max_hops: 8
+  # P1-C: 置信度评分配置（Track 0阶段使用默认值，观察REVIEW_SUGGESTED比例后再调整阈值）
+  confidence:
+    threshold_review: 75    # 低于此分数标记为REVIEW_SUGGESTED，建议人工复核
+    score_full_match: 30    # 三维全同构（交付物+核心动作+作用对象均一致）加分
+    score_rule_hit: 20      # 图谱口诀强制命中（is_rule_forced=True）加分
+    penalty_99: -25         # 使用99兜底代码减分
+    penalty_global_search: -10  # 经过GLOBAL_SEARCH重定向（初始方向错误）减分
+
+retriever:
+  model_path: "/root/autodl-tmp/bge-m3"
+  reranker_path: "/root/autodl-tmp/bge-reranker-v2-m3" 
+  top_k_recall: 100
+  top_k_rerank: 10  
+  
+data:
+  graph_cache_path: "data/cache/job_dict_graph.pkl"
+  # P1-G: GraphRAG 2.0 双轨并行配置（先不删PKL，JSON在旁路运行，等数据对齐后无缝切换）
+  # graph_json_nodes: "data/cache/graph_nodes.json"   # 待实现后取消注释
+  # graph_json_edges: "data/cache/graph_edges.json"   # 待实现后取消注释
+  graph_cache_dir: "data/cache/"
+
+test:
+  test_csv_path:
+    - data/raw_jd/2025_5.18_100.csv
+    #- data/raw_jd/2025_5.18_400.csv
+    #- data/raw_jd/2025_5.18_500.csv

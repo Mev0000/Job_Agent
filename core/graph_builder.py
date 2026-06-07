@@ -24,8 +24,10 @@ class DictGraphRAG:
         except:
             return [str(val)]
 
-    def build_graph(self):
-        """从 CSV 文件全量构建图谱"""
+    def build_graph(self, seven_d_data: Dict[str, Dict] = None):
+        """从 CSV 文件全量构建图谱，可选注入蒸馏7D特征
+        :param seven_d_data: {code: {core_actions, objects, deliverables, ...}} 蒸馏输出
+        """
         print("🚀 开始构建大典知识图谱...")
         
         # 1. 载入核心节点与属性 (Nodes_Cleaned.csv)
@@ -52,6 +54,28 @@ class DictGraphRAG:
                     envs=self._safe_literal_eval(row.get('Extracted_Environments', ''))
                 )
             print(f"✅ 载入职业节点: {len(nodes_df)} 个")
+
+        # ── 1.5 注入蒸馏7D特征（仅四级Job节点）──
+        if seven_d_data:
+            enriched, skipped = 0, 0
+            for code in self.G.nodes():
+                node = self.G.nodes[code]
+                if node.get('node_type') != 'Job':
+                    continue
+                if code not in seven_d_data:
+                    continue
+                d7 = seven_d_data[code]
+                if d7.get('_quality') == 'LOW':
+                    skipped += 1
+                    continue
+                for d7_key in ['core_actions', 'objects', 'deliverables', 'main_kpi',
+                               'environment', 'served_population', 'role_level', 'category']:
+                    val = d7.get(d7_key)
+                    if val is not None and val != [] and val != '':
+                        node[d7_key] = val
+                enriched += 1
+            total = len(seven_d_data)
+            print(f"✅ 注入7D特征: {enriched}/{total} 个节点（跳过 {skipped} 个LOW质量）")
 
         # 2. 载入层级从属边 (单向边)
         tax_path = os.path.join(self.data_dir, "Edges_Taxonomy.csv")
@@ -120,12 +144,21 @@ class DictGraphRAG:
             return None
             
         return {
+            # ── 旧字段，向后兼容 ──
             "名称": data.get("name", ""),
-            "动作": data.get("actions", []),
+            "动作": data.get("core_actions", []) or data.get("actions", []),
             "对象": data.get("objects", []),
-            "环境": data.get("envs", []),
+            "环境": data.get("environment", []) or data.get("envs", []),
             "是否涉公权": data.get("is_gov", False),
-            "是否涉临床": data.get("is_med", False)
+            "是否涉临床": data.get("is_med", False),
+            # ── 新增 7D 字段 ──
+            "deliverables": data.get("deliverables", []),
+            "main_kpi": data.get("main_kpi", ""),
+            "core_actions": data.get("core_actions", []),
+            "environment": data.get("environment", []),
+            "served_population": data.get("served_population", ""),
+            "role_level": data.get("role_level", ""),
+            "category": data.get("category", ""),
         }
 
     def get_confused_codes(self, code: str) -> List[str]:

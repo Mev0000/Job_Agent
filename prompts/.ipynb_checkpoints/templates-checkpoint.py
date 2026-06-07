@@ -17,17 +17,20 @@ JSON_COT_TEMPLATE = """
     "step_2_redline_check": "【底线审查与红线排异】... (核查是否为无意义空壳广告；核查是否越界触碰行政公权、临床处方权等法定一票否决红线)",
     "step_3_substance_hypothesis": "【实质穿透与独立假说】... (强制执行 Desc > Name。剥离虚高头衔防拔高，或启用专业豁免防降级；结合实体产业优先法则，给出一个不依赖候选库的独立二级或一级大类假说)",
     "step_4_evidence_cross_match": {
-      "check_1_deliverables": "优先比对交付物与KPI，是否一致？(如：销售合同 vs 代码文件)",
-      "check_2_core_actions": "其次比对核心动作，是否一致？(如：客户洽谈 vs 算法开发)",
-      "check_3_objects": "再比对作用对象，是否一致？(如：外部客户 vs 内部系统)",
-      "check_4_environment": "最后比对环境。注意：若名称相似但前3项不符，严禁选择！",
-      "check_5_name_similarity": "名称相似度如何？仅作参考，若前3项全不一致，名称相似无意义！"
+      "check_1_deliverables": "优先比对交付物(deliverables)与核心KPI(main_kpi)，是否一致？(如：销售合同 vs 代码文件)",
+      "check_2_core_actions": "其次比对核心动作(core_actions)，是否一致？(如：客户洽谈 vs 算法开发)",
+      "check_3_objects": "再比对作用对象(objects)，是否一致？(如：外部客户 vs 内部系统)",
+      "check_4_environment": "再比对工作环境(environment)，是否一致？",
+      "check_5_role_level": "再比对角色层级(role_level)：管理决策/专业技术/办事辅助/服务/制造，是否与候选一致？",
+      "check_6_served_population": "再比对服务对象(served_population)：内部员工vs外部客户，是否与候选一致？注意：这是区分3类vs4类的关键维度！",
+      "check_7_name_similarity": "最后看名称相似度，仅作参考。若前6项有≥2项不一致，名称再相似也严禁选择！"
     },
-    "step_5_isomorphic_finalize": "【同构检验与最终裁定】... (三维同构检验。若证据充足则 FINALIZE；若需要看大类全景则 REQ_L2；若在最后几个细项中纠结则 REQ_L3_FULL；若由于向量检索偏差导致当前选项全部离谱，则必须触发 GLOBAL_SEARCH)"
+    "step_5_isomorphic_finalize": "【七维同构检验与最终裁定】逐维比对最终候选与JD七维：若七维中≥5维一致 → 高置信度 FINALIZE；若需要看大类全景则 REQ_L2；若在最后几个细项中纠结则 REQ_L3_FULL；若由于向量检索偏差导致当前选项全部离谱，则必须触发 GLOBAL_SEARCH。最终输出前复核：check_1~check_6 是否有≥2项不一致却仍选择，若有则立即撤回重判！"
   },
   "action": "必须是以下五者之一：FINALIZE / REQ_L2 / REQ_L3_FULL / GLOBAL_SEARCH / 8-00-00",
   "result_code": "依据 action 填入格式：若 FINALIZE 填三级代码(如 4-01-06)；若 REQ_L2 填二级前缀(如 2-02)；若 REQ_L3_FULL 填想深挖的代码数组(如 ['2-02-07'])；若 GLOBAL_SEARCH 填 GLOBAL_SEARCH；若 8-00-00 填 8-00-00。",
-  "confidence_score": "置信度评分(0-100)，根据以下客观规则自动计算（无需你填写，系统自动计算）：+30分(三维全同构) | +20分(口诀强制命中) | -25分(使用99兜底) | -20分(P1不一致仍选择) | -10分(经过GLOBAL_SEARCH重定向)。系统会根据此分数决定是否需要人工复核。"
+  "confidence_score": "置信度评分(0-100)，根据以下客观规则自动计算（无需你填写，系统自动计算）：+30分(三维全同构) | +20分(口诀强制命中) | -25分(使用99兜底) | -20分(P1不一致仍选择) | -10分(经过GLOBAL_SEARCH重定向)。系统会根据此分数决定是否需要人工复核。",
+  "is_rule_forced": "布尔值 true/false。若检索层在候选上下文中标注了【口诀强制命中】，你必须输出 true；否则输出 false。（此字段由检索层驱动，不是你主观判断）"
 }
 
 【反思型示例学习 (Few-Shot Learning)】
@@ -37,26 +40,38 @@ JSON_COT_TEMPLATE = """
 输入：JD = "负责大客户维护，完成销售指标，管理客户关系"
 错误历史：曾误判为【2-06-07 商务专业人员】(2类)
 正确推理：
-  step_3 假说：看到"经理"头衔，初步怀疑2类，但执行 Level 1.3 口诀 → KA经理默认4类，JD无"产品架构/研发统筹"，故假说为4类
-  step_4 核查：check_1交付物=销售合同(4类特征)，check_2核心动作=客户洽谈(4类)，check_3对象=外部客户(4类) → 三维全一致，名称"经理"忽略
+  step_1 七维提取：
+   ① core_actions=客户维护/销售指标管理 ② objects=外部客户 ③ environment=市场/销售场所
+   ④ deliverables=销售合同/客户台账 ⑤ main_kpi=销售额完成率
+   ⑥ served_population=外部客户 → 4类 ⑦ role_level=执行层(4类)
+  step_3 假说：看到"经理"头衔初步怀疑2类，但执行 Level 1.3 口诀 → KA经理默认4类；served_population=外部客户 进一步确认4类；role_level 无"战略制定"动词 → 非1类/2类
+  step_4 核查：check_1交付物=销售合同(4类) ✓ check_2核心动作=客户洽谈(4类) ✓ check_3对象=外部客户(4类) ✓ check_4环境=市场(4类) ✓ check_5角色层级=执行层 ✓ check_6服务对象=外部客户 ✓ → 七维全一致！
   step_5 裁定：FINALIZE -> 4-01-02 (营销员)
-教训：头衔含"经理/总监"不等于2类，必须看交付物和核心动作！
+教训：头衔含"经理/总监"不等于2类，必须看七维（尤其是 served_population 和 role_level）！
 
 --- 示例 2：99兜底滥用错误 ---
 输入：JD = "负责公司前台接待，接听电话，转接邮件，办理员工入职手续"
 错误历史：曾误判为【3-01-99 其他办事人员】(99兜底)
 正确推理：
-  step_3 假说：前台接待+入职手续 → 3-01(行政办事)
-  step_4 核查：check_1交付物=接待记录/入职表格(3类特征)，check_2核心动作=前台服务/手续办理(3类)，check_3对象=内部员工(3类) → 三维全一致
+  step_1 七维提取：
+   ① core_actions=接待/电话转接/手续办理 ② objects=内部员工 ③ environment=公司前台/办公区
+   ④ deliverables=接待记录/入职表格 ⑤ main_kpi=员工满意度/接待效率
+   ⑥ served_population=内部员工 → 3类 ⑦ role_level=办事辅助(3类)
+  step_3 假说：served_population=内部员工 → 3类(办事辅助)；role_level=办事辅助(无"战略制定"动词)
+  step_4 核查：check_1交付物=接待记录(3类) ✓ check_2核心动作=手续办理(3类) ✓ check_3对象=内部员工(3类) ✓ check_4环境=办公区(3类) ✓ check_5角色层级=办事辅助 ✓ check_6服务对象=内部员工 ✓ → 七维全一致！
   step_5 裁定：NOT 99兜底！存在精确匹配 3-01-02(行政事务处理人员)，故 FINALIZE -> 3-01-02
-教训：99兜底仅在"与该大类下所有已知细分存在根本性质差异"时使用，严禁偷懒！
+教训：99兜底仅在"与该大类下所有已知细分存在根本性质差异"时使用，严禁偷懒！served_population 和 role_level 是区分3类vs4类的关键，必须提取！
 
 --- 示例 3：step_3走偏被step_4纠正 ---
 输入：JD = "负责电商平台店铺运营，包括商品上架、活动策划、数据统计"
 错误历史：step_3 曾误判为【2-06-07 商务专业人员】(2类)
 正确推理：
-  step_3 假说（错误）：看到"运营"+"策划"，误判为2类商务专业 → 假说 2-06
-  step_4 核查（纠正）：check_1交付物=商品上架记录/活动数据(4类电商特征)，check_2核心动作=店铺运营/活动执行(4类)，check_3对象=电商平台/消费者(4类) → 三维全指向4类，与假说2-06不一致！
+  step_1 七维提取：
+   ① core_actions=商品上架/活动策划/数据统计 ② objects=电商平台/消费者 ③ environment=线上店铺/后台系统
+   ④ deliverables=商品页面/活动数据报告 ⑤ main_kpi=GMV/转化率
+   ⑥ served_population=外部消费者 → 4类 ⑦ role_level=生产生活服务(4类)
+  step_3 假说（错误）：看到"运营"+"策划"，误判为2类商务专业 → 假说 2-06；但 served_population=外部消费者 → 应偏向4类；role_level 无"创制性动词" → 非2类
+  step_4 核查（纠正）：check_1交付物=商品页面(4类电商) ✓ check_2核心动作=店铺运营(4类) ✓ check_3对象=消费者(4类) ✓ check_4环境=线上(4类) ✓ check_5角色层级=服务类 ✓ check_6服务对象=外部(4类) ✓ → 七维全指向4类，与假说2-06不一致！
   step_5 裁定：step_4发现假说错误，立即自我纠正 → FINALIZE -> 4-01-06 (电子商务师)
-教训：step_4必须实事求是比对证据，严禁为了"证明假说"而歪曲证据！
+教训：step_4必须实事求是比对七维证据，严禁为了"证明假说"而歪曲证据！served_population(外部消费者) 是区分2类(专业服务)vs4类(电商服务)的关键！
 """

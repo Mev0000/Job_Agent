@@ -30,3 +30,9 @@ data:
   # graph_json_nodes: "data/cache/graph_nodes.json"   # 待实现后取消注释
   # graph_json_edges: "data/cache/graph_edges.json"   # 待实现后取消注释
   graph_cache_dir: "data/cache/"
+
+test:
+  test_csv_path:
+    - data/raw_jd/2025_5.18_100.csv
+    #- data/raw_jd/2025_5.18_400.csv
+    #- data/raw_jd/2025_5.18_500.csv

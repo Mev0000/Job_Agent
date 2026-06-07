@@ -34,15 +34,51 @@ class JobAgentStateMachine:
         # 🌟 修复 1：取消截断，打印全量日志以便排查！
         print(f"\n[🚨 DEBUG 监控] 模型输出 (全量展示)：\n{text}\n{'='*40}")
         
+        # 🌟 修复 2：预处理字符串值内的实际换行符等控制字符
+        # LLM 有时会在 JSON 字符串值中直接输出实际换行符（而非 \n 转义），
+        # 这会导致 json.loads 报 "Expecting ',' delimiter" 错误。
+        # 用状态机精确转义字符串值内的控制字符，不影响字符串外的格式。
+        def _escape_control_chars(s: str) -> str:
+            result = []
+            in_string = False
+            escape_next = False
+            for c in s:
+                if escape_next:
+                    # 如果在字符串内部且下一个字符不是合法的 JSON 转义字符
+                    # （如 \approx 中的 \a），则多输出一个反斜杠将其转义
+                    if in_string and c not in '"\\/bfnrtu':
+                        result.append('\\')
+                    result.append(c)
+                    escape_next = False
+                elif c == '\\':
+                    result.append(c)
+                    escape_next = True
+                elif c == '"':
+                    if not escape_next:
+                        in_string = not in_string
+                    result.append(c)
+                elif in_string:
+                    if c == '\n':
+                        result.append('\\n')
+                    elif c == '\r':
+                        result.append('\\r')
+                    elif c == '\t':
+                        result.append('\\t')
+                    else:
+                        result.append(c)
+                else:
+                    result.append(c)
+            # 如果字符串以孤立的反斜杠结尾，补一个转义
+            if escape_next and in_string:
+                result.append('\\')
+            return ''.join(result)
+        
         try:
-            # 🌟 修复 2：预处理非法转义符。大模型有时会输出未转义的反斜杠(如 \s, \d 或者单纯的 \ )
-            # 这会导致 json.loads 报 Invalid \escape 错误。我们将单反斜杠替换为双反斜杠进行安全逃逸。
-            clean_text = text.replace('\\', '\\\\')
+            clean_text = _escape_control_chars(text)
             
             # 策略 1：优先匹配被 ```json ... ``` 包裹的内容
             match = re.search(r'```json\s*(.*?)\s*```', clean_text, re.DOTALL)
             if match:
-                # strict=False 允许 JSON 中包含某些非法的控制字符（如真实的换行符）
                 return json.loads(match.group(1).strip(), strict=False)
                 
             # 策略 2：如果没有包裹，寻找最外层的 {}
@@ -392,9 +428,53 @@ class JobAgentStateMachine:
                 
                 full_dict_context = "\n".join(l2_features) if l2_features else f"⚠️ 系统未找到大类 {requested_l2_codes}。"
                 
+                # 🌟【核心修复】REQ_L2 二次向量召回：在该 L2 范围内做 Reranker 打分
+                # 避免 LLM 纯靠名称推理导致误判（瓶颈2的修复）
+                scoped_recall_context = ""
+                try:
+                    scoped_recall_context = self.retriever.retrieve_scoped(
+                        job_name, job_desc, requested_l2_codes
+                    )
+                    if scoped_recall_context:
+                        print(f"  🎯 [二次召回] 已在该 L2 范围内完成 Reranker 交叉打分，注入 Top-K 精准候选")
+                    else:
+                        print(f"  ⚠️ [二次召回] 该 L2 范围内无匹配候选（向量分数全低于阈值）")
+                except Exception as e:
+                    print(f"  ⚠️ [二次召回] 执行异常: {e}，降级为纯定义模式")
+                
                 # 🌟 挂载上一步反思与多向选择权
                 ledger_text = "\n".join(exploration_ledger) if exploration_ledger else "无"
-                memory_block = f"""【🧭 你的全局探索轨迹账本 (防循环死锁)】
+                
+                # 组装记忆模块：优先展示向量召回结果，再展示全量定义
+                # 🌟 scoped_recall_context 开头已包含置信度信号（警报或正常值）
+                if scoped_recall_context:
+                    memory_block = f"""【🧭 你的全局探索轨迹账本 (防循环死锁)】
+你之前已经探索过以下路径并得出了结论，请避免重复请求已被否定的代码大类：
+{ledger_text}
+
+【当前跳反思记录】
+{json.dumps(reasoning, ensure_ascii=False, indent=2)}
+
+【🎯 系统响应：二次向量精准召回（Reranker 交叉注意力打分）】
+系统已在 {requested_l2_codes} 范围内用 Reranker 重新打分。
+⚠️ 请先仔细阅读最上方的「置信度信号」，再查看候选列表：
+{scoped_recall_context}
+
+请优先基于以上候选做七维交叉验证。若以上候选全部不匹配，可再查阅下方全量定义列表。
+
+【系统响应：大类全景定义（全量备查）】
+以下是 {requested_l2_codes} 旗下所有的三级与四级细分：
+{full_dict_context}
+
+🎯 【下一步行动指令 (宏观多向选择)】：
+1. 🎯【首选】对上方「二次向量精准召回」中的候选做七维交叉验证，若匹配则直接 【FINALIZE】。
+2. 🚨 若置信度警报触发（低分），必须在 Step 3 独立假说中讨论是否选错大类，如可疑就输出 action=\"REQ_L2\" 换路。
+3. 若向量召回候选均不匹配但下方定义列表中有合适选项，可自行选择后 【FINALIZE】。
+4. 若在当前大类的 2-3 个三级选项间犹豫，请输出动作 【REQ_L3_FULL】 调阅其微观任务清单。
+5. 🚨 若确认当前大类错误，可基于上方的【探索账本】避开雷区，再次输出 【REQ_L2】 指定其他二级前缀。
+6. 🚨 【终极逃逸】：若彻底迷失方向或发现与真实产业发生严重偏离，请果断输出动作 【GLOBAL_SEARCH】。"""
+                else:
+                    memory_block = f"""【🧭 你的全局探索轨迹账本 (防循环死锁)】
 你之前已经探索过以下路径并得出了结论，请避免重复请求已被否定的代码大类：
 {ledger_text}
 
