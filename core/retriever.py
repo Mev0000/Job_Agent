@@ -1,5 +1,7 @@
 # core/retriever.py
 
+import json
+import os
 import torch
 import numpy as np
 import re
@@ -68,6 +70,18 @@ class AdvancedRetriever:
             self.graph.build_graph()
             self.graph.save_to_disk(cache_path)
 
+        # ---------------- 3.5 加载蒸馏 7D 图谱数据（从 graph_nodes.json 注入全量七维属性）----------------
+        self._last_hop1_pool = {}  # Hop-1 全量候选池，供跨 L2 对照注入使用
+        self._graph_7d = {}
+        cache_dir = os.path.dirname(config.get("data", {}).get("graph_cache_path", "data/cache/job_dict_graph.pkl"))
+        nodes_7d_path = os.path.join(cache_dir, "graph_nodes.json")
+        if os.path.exists(nodes_7d_path):
+            with open(nodes_7d_path, 'r', encoding='utf-8') as f:
+                self._graph_7d = json.load(f)
+            print(f"✅ 加载蒸馏 7D 图谱: {len(self._graph_7d)} 个节点（Step 4 比对升级为 ground truth 模式）")
+        else:
+            print(f"⚠️ 未找到 {nodes_7d_path}，Step 4 比对降级为 LLM 盲猜模式")
+
         print("✅ 级联双轨检索引擎 (Base + Reranker + GraphRAG) 上线完毕！")
 
     def retrieve(self, job_name: str, job_desc: str) -> str:
@@ -78,8 +92,19 @@ class AdvancedRetriever:
         # 阶段 2：GraphRAG 深度安检与强制绑定 (图谱路)
         audited_pool = self._audit_and_bind(vector_candidates, job_name, job_desc)
         
+        # 🔧 P0: 保存 Hop-1 全量候选池，供后续跨 L2 对照注入使用
+        self._last_hop1_pool = audited_pool
+        
         # 阶段 3：宁缺毋滥的断崖式阶梯截断
         final_candidates = self._cliff_cut(audited_pool)
+        
+        print(f"  🔍 [检索调试] 审计池: {len(audited_pool)} 个候选 | 截断后: {len(final_candidates)} 个候选")
+        if len(final_candidates) == 0:
+            # 🔧 修复：sorted_items 是 _cliff_cut() 局部变量，此处无法访问，改用 audited_pool 诊断
+            top5 = sorted(audited_pool.items(), key=lambda x: x[1].get('score', 0), reverse=True)[:5]
+            top5_scores = [f"{code}:{data.get('score', 0):.3f}" for code, data in top5]
+            print(f"  ⚠️ [检索调试] 所有候选被截断！Top5 分数: {', '.join(top5_scores)}")
+            print(f"  ⚠️ [检索调试] MIN_ABS_SCORE: 0.1 (局部变量，非实例属性)")
         
         # 阶段 4：决战圈虫洞交叉排查 (Wormhole 互斥扫描)
         self._apply_wormhole_warnings(final_candidates)
@@ -97,7 +122,19 @@ class AdvancedRetriever:
                 rule_forced_in_final.append(code)
         if rule_forced_in_final:
             final_prompt_context += "\n⚠️ 口诀强制命中：" + "、".join(rule_forced_in_final) + "\n"
-
+        
+        # P1-B（跨 L2 对照注入 — 增强版）：防止 Hop-1 过早定谳选错大类
+        # 从 Hop-1 全局审计池中提取其他 L2 高分候选供 LLM 对照
+        current_l2_prefixes = list(set("-".join(code.split("-")[:2]) for code, _ in final_candidates))
+        cross_l2_context = self._inject_cross_l2_challengers(current_l2_prefixes)
+        if cross_l2_context:
+            final_prompt_context += (
+                "\n\n⚠️⚠️⚠️ 【Hop-1 关键提醒：跨大类对照候选已注入】 ⚠️⚠️⚠️\n"
+                "以下来自其他大类的候选人在 Hop-1 初始检索中获得了与当前候选相近的分数。\n"
+                "请在 Step 1 大类定位时，认真对比这些跨类候选人的劳动事实，\n"
+                "确认当前候选的 L2 大类方向是否正确，避免 Hop-1 过早定谳出错！\n"
+            )
+            final_prompt_context += cross_l2_context
 
         return final_prompt_context
 
@@ -184,7 +221,83 @@ class AdvancedRetriever:
                 f"最高分候选: {top1_score:.3f}"
             )
         
-        return signal_header + "\n\n" + context
+        # ── 6. 跨 L2 对照候选注入（防止选错大类的死亡螺旋）──
+        cross_l2_context = self._inject_cross_l2_challengers(l2_prefixes)
+        
+        return signal_header + "\n\n" + context + cross_l2_context
+
+    def _inject_cross_l2_challengers(self, target_l2_prefixes: List[str]) -> str:
+        """【P0 跨 L2 对照注入】从 Hop-1 全局池中提取其他 L2 的高分候选，注入到 scoped 召回上下文
+        
+        解决"LLM 选错 L2 → scoped 召回全错 → LLM 更自信地选错"的死亡螺旋。
+        从 Hop-1 全局候选池中捞出不属于当前 L2 但分数较高的候选，
+        附带完整 7D 特征卡，让 LLM 在 Step 4 做跨类七维比对。
+        
+        Args:
+            target_l2_prefixes: 当前选中的 L2 前缀列表，如 ["4-01"]
+            
+        Returns:
+            格式化后的跨 L2 对照候选上下文字符串，无候选时返回空字符串
+        """
+        if not self._last_hop1_pool:
+            return ""
+        
+        # 收集所有非目标 L2 的候选
+        cross_l2_candidates = []
+        for code, data in self._last_hop1_pool.items():
+            l2_prefix = "-".join(code.split("-")[:2])
+            if l2_prefix not in target_l2_prefixes:
+                # 补齐 7D（如果还未合并）
+                features = data.get("features", {})
+                nd7 = self._graph_7d.get(code)
+                if nd7 and "deliverables" not in features:
+                    features["deliverables"] = nd7.get("deliverables", [])
+                    features["served_population"] = nd7.get("served_population", [])
+                    features["role_level"] = nd7.get("role_level", "")
+                    features["main_kpi"] = nd7.get("main_kpi", "")
+                
+                cross_l2_candidates.append({
+                    "code": code,
+                    "l2": l2_prefix,
+                    "score": data.get("score", 0),
+                    "name": data.get("name", "未知"),
+                    "features": features,
+                    "source": data.get("source", "Vector_Search")
+                })
+        
+        if not cross_l2_candidates:
+            return ""
+        
+        # 按分数排序，取 Top 3（从2扩至3，增强对照力度）
+        cross_l2_candidates.sort(key=lambda x: x["score"], reverse=True)
+        top_challengers = cross_l2_candidates[:3]
+        
+        # 格式化输出
+        blocks = [
+            "\n\n🌐🌐🌐 【跨 L2 对照候选 — 来自 Hop-1 全局池的其他大类高分候选】🌐🌐🌐",
+            f"⚠️ 以下候选来自【非 {', '.join(target_l2_prefixes)}】的其他大类，但在 Hop-1 全局检索中得分较高。",
+            "请在 Step 4 七维比对时，也对照检查以下候选人，确认当前 L2 选择是否正确：\n"
+        ]
+        
+        for rank, c in enumerate(top_challengers, 1):
+            f = c["features"]
+            a = ", ".join(f.get("core_actions", []) or f.get("动作", []))[:80]
+            d = ", ".join(f.get("deliverables", []) or [])[:80]
+            s = ", ".join(f.get("served_population", []) if isinstance(f.get("served_population"), list) else ([f.get("served_population", "")] if f.get("served_population") else []))[:60]
+            r = f.get("role_level", "") or ""
+            
+            blocks.append(
+                f"  [{rank}] [{c['code']}] {c['name']} (L2={c['l2']}, 分数={c['score']:.3f}, 来源={c['source']})\n"
+                f"      核心动作: {a}\n"
+                f"      交付物:   {d}\n"
+                f"      服务对象: {s}\n"
+                f"      责任层级: {r}"
+            )
+        
+        blocks.append("\n🔴 强制要求：在 Step 3 独立假说中明确讨论上述对照候选是否更匹配。如发现当前 L2 错误，立即 REQ_L2 换路！")
+        blocks.append("🌐🌐🌐 【跨 L2 对照候选结束】🌐🌐🌐\n")
+        
+        return "\n".join(blocks)
 
     def _compute_rerank_scores(self, query: str, texts: List[str], batch_size=4) -> np.ndarray:
         """原生 Reranker 批处理打分机制，防 OOM"""
@@ -302,6 +415,20 @@ class AdvancedRetriever:
                 
             features = self.graph.get_job_features(code)
             if not features: continue 
+            
+            # 🔧 P0-FIX：合并蒸馏 7D（从 graph_nodes.json），补齐 deliverables / served_population / role_level
+            nd7 = self._graph_7d.get(code)
+            if nd7:
+                features["core_actions"] = nd7.get("core_actions", [])
+                features["objects"] = nd7.get("objects", [])
+                features["deliverables"] = nd7.get("deliverables", [])
+                features["main_kpi"] = nd7.get("main_kpi", "")
+                features["environment"] = nd7.get("environment", [])
+                features["served_population"] = nd7.get("served_population", [])
+                features["role_level"] = nd7.get("role_level", "")
+                features["category"] = nd7.get("category", "")
+                features["Is_Government"] = nd7.get("Is_Government", features.get("是否涉公权", False))
+                features["Is_Medical_Clinical"] = nd7.get("Is_Medical_Clinical", features.get("是否涉临床", False))
                 
             audited_pool[code] = {
                 "source": "Vector_Search", "score": cand['score'],
@@ -315,6 +442,19 @@ class AdvancedRetriever:
                 
                 if c_code not in audited_pool:
                     c_features = self.graph.get_job_features(c_code)
+                    # 🔧 同样为 Force-Bind 候选补齐 7D
+                    c_nd7 = self._graph_7d.get(c_code)
+                    if c_nd7:
+                        c_features["core_actions"] = c_nd7.get("core_actions", [])
+                        c_features["objects"] = c_nd7.get("objects", [])
+                        c_features["deliverables"] = c_nd7.get("deliverables", [])
+                        c_features["main_kpi"] = c_nd7.get("main_kpi", "")
+                        c_features["environment"] = c_nd7.get("environment", [])
+                        c_features["served_population"] = c_nd7.get("served_population", [])
+                        c_features["role_level"] = c_nd7.get("role_level", "")
+                        c_features["category"] = c_nd7.get("category", "")
+                        c_features["Is_Government"] = c_nd7.get("Is_Government", c_features.get("是否涉公权", False))
+                        c_features["Is_Medical_Clinical"] = c_nd7.get("Is_Medical_Clinical", c_features.get("是否涉临床", False))
                     c_corpus_data = self.corpus_dict.get(c_code)
                     if c_features and c_corpus_data:
                         # P1 优化：使用 Reranker 对 JD 和该易混对手单独打分
@@ -357,13 +497,16 @@ class AdvancedRetriever:
         """【阶段 3】动态阶梯截断与去重机制
         
         P1 优化：Force-Bind 候选最多占 4/8 席，防止易混对手挤占向量精排结果
+        P2 优化：CLIFF_TOLERANCE 从 0.15 → 0.20，防止高置信度第一名直接截断后续对照候选
+                 新增 MIN_CANDIDATES=3 保底，截断后候选数不足3时自动补入次高分候选（忽略断崖）
         """
         sorted_items = sorted(pool.items(), key=lambda x: x[1]['score'], reverse=True)
         if not sorted_items: return []
 
         MAX_CANDIDATES = 8           
-        MIN_ABS_SCORE = 0.3          
-        CLIFF_TOLERANCE = 0.15       
+        MIN_ABS_SCORE = 0.1          # 🔧 修复：从 0.3 降到 0.1，防止高质量候选被过滤
+        CLIFF_TOLERANCE = 0.35       # 🔧 P3 优化：从 0.20 → 0.35，进一步放宽断崖容忍度，防止第一名截断所有对照候选
+        MIN_CANDIDATES = 5           # 🔧 P2 优化：截断后最少保留 5 个候选供 LLM 对照（从3提升）
         MAX_SAME_L2 = 4
         MAX_FORCE_BIND = 4  # P1 优化：Force-Bind 最多占 4/8 席
 
@@ -395,6 +538,23 @@ class AdvancedRetriever:
 
             final_candidates.append((code, data))
             if len(final_candidates) >= MAX_CANDIDATES: break
+
+        # 🔧 P2 优化：MIN_CANDIDATES 保底机制
+        # 若截断后候选数不足 MIN_CANDIDATES，从剩余 sorted_items 中按分数补入（忽略断崖限制，仅保留绝对下限）
+        if len(final_candidates) < MIN_CANDIDATES:
+            existing_codes = {code for code, _ in final_candidates}
+            for code, data in sorted_items:
+                if len(final_candidates) >= MIN_CANDIDATES:
+                    break
+                if code in existing_codes:
+                    continue
+                score = data['score']
+                is_force_bind = (data['source'] == "GraphRAG_Force_Bind")
+                if not is_force_bind and score < MIN_ABS_SCORE:
+                    break  # 绝对下限仍然生效
+                final_candidates.append((code, data))
+                existing_codes.add(code)
+                print(f"  🔄 [候选池保底] 补入第{len(final_candidates)}个候选: [{code}] score={score:.3f}")
 
         return final_candidates
 
@@ -452,10 +612,10 @@ class AdvancedRetriever:
                 d_short = ", ".join(features.get('deliverables', []) or features.get('交付物', []))[:60]
                 block += f"- 🔍 核心动作: {a_short}  |  交付物: {d_short}\n"
 
-            # 法理红线（全量展示）
+            # 法理红线（全量展示，兼容新旧字段名）
             redlines = []
-            if features.get("是否涉公权"): redlines.append("⚠️ 涉国家公权执行")
-            if features.get("是否涉临床"): redlines.append("⚠️ 涉医疗处方/临床")
+            if features.get("是否涉公权") or features.get("Is_Government"): redlines.append("⚠️ 涉国家公权执行")
+            if features.get("是否涉临床") or features.get("Is_Medical_Clinical"): redlines.append("⚠️ 涉医疗处方/临床")
             if redlines: block += f"- ⚖️ 法理体检: {' | '.join(redlines)}\n"
 
             # 易混淆口诀（全量展示）

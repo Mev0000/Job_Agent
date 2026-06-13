@@ -10,19 +10,21 @@ llm:
 
 agent:
   max_hops: 8
-  # P1-C: 置信度评分配置（Track 0阶段使用默认值，观察REVIEW_SUGGESTED比例后再调整阈值）
+  # P1-C: 置信度评分配置（v3.5 梯度化重设计）
   confidence:
-    threshold_review: 75    # 低于此分数标记为REVIEW_SUGGESTED，建议人工复核
-    score_full_match: 30    # 三维全同构（交付物+核心动作+作用对象均一致）加分
-    score_rule_hit: 20      # 图谱口诀强制命中（is_rule_forced=True）加分
-    penalty_99: -25         # 使用99兜底代码减分
+    threshold_review: 65    # 低于此分数标记为REVIEW_SUGGESTED，建议人工复核
+    score_per_dimension: 5  # 七维比对中每1维"一致" +5分（6维满额+30）
+    score_rule_hit: 10      # 图谱口诀强制命中（is_rule_forced=True）加分
+    score_boundary_check: 5 # check_0边界预检有正向指引加分
+    penalty_99: -15         # 使用99兜底代码减分（区分合法穷举与滥用）
+    penalty_p1_mismatch: -15  # ≥2维明确不一致仍选择该候选减分
     penalty_global_search: -10  # 经过GLOBAL_SEARCH重定向（初始方向错误）减分
 
 retriever:
   model_path: "/root/autodl-tmp/bge-m3"
   reranker_path: "/root/autodl-tmp/bge-reranker-v2-m3" 
   top_k_recall: 100
-  top_k_rerank: 10  
+  top_k_rerank: 15  
   
 data:
   graph_cache_path: "data/cache/job_dict_graph.pkl"
