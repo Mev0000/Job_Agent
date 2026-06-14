@@ -35,6 +35,6 @@ data:
 
 test:
   test_csv_path:
-    - data/raw_jd/2025_5.18_100.csv
-    #- data/raw_jd/2025_5.18_400.csv
+    #- data/raw_jd/2025_5.18_100.csv
+    - data/raw_jd/2025_5.18_400.csv
     #- data/raw_jd/2025_5.18_500.csv
